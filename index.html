@@ -91,9 +91,11 @@
         let assassinTargetId = '';
         let assassinGuess = '';
 
-        // Engine Internals
+        // Engine Internals (STRUCTURED AI MEMORY)
         let isGameActive = false;
-        let aiMemory = {};
+        let aiMemory = {}; // Will hold { privateKnowledge: [], actionHistory: [] }
+        let publicEvents = []; // Public facts array
+        let recentDiscussion = []; // Rolling array of recent chats
         let humanResolve = null;
         let nightActions = {};
         let doctorLastProtectedId = null;
@@ -135,6 +137,15 @@
         };
 
         const isSetupValid = () => geminiApiKey.trim() || groqApiKey.trim() || mistralApiKey.trim() || useOllama;
+
+        const getFormatGuide = (taskType) => {
+            if (taskType === 'chat') return "One natural discussion message.\nNothing else.\nDo not vote or act.\nDo not use *actions* or markdown.";
+            if (taskType === 'vote') return "Reasoning...\n\nVOTE: PlayerName\n(Or VOTE: None)";
+            if (taskType === 'target') return "Reasoning...\n\nTARGET: PlayerName\n(Or TARGET: None)";
+            if (taskType === 'guess') return "Reasoning...\n\nGUESS: Yes\n(Or GUESS: No)";
+            if (taskType === 'assassinate') return "Reasoning...\n\nASSASSINATE: PlayerName - RoleName\n(Or ASSASSINATE: None)";
+            return "";
+        };
 
         // ==========================================
         // UI RENDERING SYSTEM
@@ -197,10 +208,8 @@
             if (field === 'numAIs') numAIs = parseInt(value);
             if (field === 'preferredRole') preferredRole = value;
             
-            // Only re-render for things that heavily change UI structure to preserve focus
             if (field === 'numAIs') document.getElementById('numAIsDisplay').innerText = numAIs;
             
-            // Update disabled state of start button
             const btn = document.getElementById('startSetupBtn');
             const warn = document.getElementById('setupWarning');
             if (btn) btn.disabled = !isSetupValid();
@@ -586,22 +595,32 @@
         // GAME VIEW & ENGINE
         // ==========================================
         
-        const addLog = (text, visibility = ['all'], icon = null, speakerName = null) => {
+        window.addLog = (text, visibility = ['all'], icon = null, speakerName = null) => {
             const newLog = { id: Math.random(), text, visibility, icon, speakerName };
             logs.push(newLog);
             
-            players.filter(p => !p.isHuman && p.isAlive).forEach(ai => {
-                const align = getRoleAlignment(ai.role);
-                const canSee = visibility.includes('all') || visibility.includes(ai.id) || (visibility.includes('Mafia') && align === 'Mafia');
-                if (canSee) {
-                    let prefix = speakerName ? `${speakerName}: ` : `EVENT: `;
-                    aiMemory[ai.id] += `${prefix}${text}\n`;
+            // Structure into specific memory categories
+            if (visibility.includes('all')) {
+                if (speakerName) {
+                    recentDiscussion.push(`${speakerName}: ${text}`);
+                    if (recentDiscussion.length > 15) recentDiscussion.shift();
+                } else {
+                    publicEvents.push(`Day ${gameDay}, ${gamePhase}: ${text}`);
                 }
-            });
+            } else {
+                players.forEach(ai => {
+                    if (!ai.isHuman && ai.isAlive && (visibility.includes(ai.id) || (visibility.includes('Mafia') && getRoleAlignment(ai.role) === 'Mafia'))) {
+                        if (speakerName) {
+                            aiMemory[ai.id].privateKnowledge.push(`Mafia Chat - ${speakerName}: ${text}`);
+                        } else {
+                            aiMemory[ai.id].privateKnowledge.push(`Day ${gameDay}, ${gamePhase}: ${text}`);
+                        }
+                    }
+                });
+            }
             
             window.appendLogToDOM(newLog);
         };
-        window.addLog = addLog;
         
         const syncUI = () => {
             renderGameBoard();
@@ -692,7 +711,6 @@
             return false;
         };
 
-        // Partial Renders for smooth updates
         function renderGameBoard() {
             const tableEl = document.getElementById('game-table-center');
             if (tableEl) {
@@ -743,7 +761,7 @@
 
         window.appendLogToDOM = (log) => {
             const isVisibleToHuman = isLogVisible(log);
-            if (!isVisibleToHuman && !winner) return; // Hide completely
+            if (!isVisibleToHuman && !winner) return;
             
             let bgStyle = 'bg-gray-950 border-gray-800/50';
             if (log.speakerName) bgStyle = 'bg-gray-800/50 border-gray-700';
@@ -839,7 +857,6 @@
             document.getElementById('assassin-menu-container').innerHTML = assassinMenu;
             document.getElementById('input-area-container').innerHTML = inputArea;
             
-            // Re-render logs fully since this function handles major UI shifts on the right side
             const logsContainer = document.getElementById('logs-container');
             logsContainer.innerHTML = '';
             logs.forEach(log => window.appendLogToDOM(log));
@@ -882,6 +899,11 @@
             assassinationMenuOpen = false;
             doctorLastProtectedId = null; 
             appState = 'game';
+            
+            publicEvents = [];
+            recentDiscussion = [];
+            aiMemory = {};
+            
             render();
 
             const activeRolesInGame = [...new Set(players.map(p => p.role))];
@@ -892,7 +914,6 @@
             const jesterRuleText = activeRolesInGame.includes('Jester') ? '\nCRITICAL NOTICE: There is a Jester in this match! The Jester only wins if they successfully trick everyone into voting them out. Do not easily fall for players acting suspiciously on purpose just to get executed.' : '';
             const independentActionDirective = '\nINDEPENDENCE PRINCIPLE: You can and should make independent decisions IF you disagree with the group\'s opinions or the consensus. You do not have to follow the crowd, and sometimes breaking away from standard consensus is highly advised to find the truth or protect your faction.';
 
-            aiMemory = {};
             players.forEach(p => {
                 if (!p.isHuman) {
                     let align = getRoleAlignment(p.role);
@@ -904,44 +925,78 @@
 
                     let knownPublicInfo = indecisives ? `PUBLIC KNOWLEDGE: Everyone knows that ${indecisives} is the Indecisive, and is 100% confirmed Town.` : '';
 
-                    aiMemory[p.id] = `SYSTEM PROMPT: You are playing a text-based game of Mafia as an AI. 
-Name: ${p.name}. Role: ${p.role} (${align}). 
-Playstyle constraint: ${p.playstyle || 'Play logically and naturally.'}
-Rules: You are talking to other players. Do not break character. Do not be overly robotic. Keep your responses short (1-3 sentences max). Bluff if you need to. ALWAYS refer to other players by their specific NAME, never by a role. Do NOT use *asterisks* or markdown for actions (e.g., no *smiles*, *nods*, or *laughs*). Just speak naturally.${extraRules}${jesterRuleText}${independentActionDirective}
-
-THE FOLLOWING ROLES ARE ACTIVE IN THIS MATCH:
-${rolesListText}
-
-${knownPublicInfo}
-
-MEMORY START:
-The game has just begun. Nothing has happened yet. Nobody has spoken.\n`;
+                    aiMemory[p.id] = {
+                        systemBase: `SYSTEM INSTRUCTIONS\nYou are playing a text-based game of Mafia as an AI.\nName: ${p.name}\nRole: ${p.role} (${align})\nPlaystyle constraint: ${p.playstyle || 'Play logically and naturally.'}\n\nCRITICAL RULES:\n- The moderator's structured information is always correct. Never contradict it.\n- Never invent deaths, investigations, attacks, votes, discussions, role claims, relationships, or conversations.\n- If something is not listed in the provided information, assume it never happened.\n- Do not use *asterisks* or markdown for actions. Just speak naturally.\n- Only living players can act or speak.${extraRules}${jesterRuleText}${independentActionDirective}\n\nTHE FOLLOWING ROLES ARE ACTIVE IN THIS MATCH:\n${rolesListText}\n\n${knownPublicInfo}`,
+                        privateKnowledge: [],
+                        actionHistory: []
+                    };
                 }
             });
 
             runGameLoop();
         };
 
-        const callAI = async (playerId, prompt) => {
+        const buildAIPrompt = (player, taskPrompt, formatGuide, repromptError = "") => {
+            const alivePlayers = players.filter(p => p.isAlive).map(p => p.name);
+            const deadPlayers = players.filter(p => !p.isAlive).map(p => p.name);
+            
+            const mem = aiMemory[player.id];
+            
+            let prompt = `${mem.systemBase}
+
+CURRENT GAME STATE
+Current Day: ${gameDay}
+Current Phase: ${gamePhase}
+
+Alive Players (${alivePlayers.length}):
+${alivePlayers.length ? alivePlayers.map(n => '- ' + n).join('\n') : 'None'}
+
+Dead Players:
+${deadPlayers.length ? deadPlayers.map(n => '- ' + n).join('\n') : 'None'}
+
+PUBLIC FACTS
+${publicEvents.length ? publicEvents.map(e => '- ' + e).join('\n') : '- Nothing has happened yet.'}
+
+YOUR MEMORY (Private Knowledge)
+${mem.privateKnowledge.length ? mem.privateKnowledge.map(e => '- ' + e).join('\n') : '- Nothing yet.'}
+
+YOUR ACTIONS (History)
+${mem.actionHistory.length ? mem.actionHistory.map(e => '- ' + e).join('\n') : '- No actions taken yet.'}
+
+RECENT DISCUSSION
+${recentDiscussion.length ? recentDiscussion.join('\n') : 'No recent discussion.'}
+
+YOUR TASK
+${taskPrompt}
+
+OUTPUT FORMAT REQUIRED:
+${formatGuide}
+`;
+
+            if (repromptError) {
+                prompt += `\n\nERROR ON PREVIOUS ATTEMPT:\n${repromptError}\nYou MUST correct this and follow the requested format exactly!`;
+            }
+
+            return prompt;
+        };
+
+        const callAI = async (playerId, taskPrompt, taskType, validTargetsArray = []) => {
             const ai = players.find(p => p.id === playerId);
             if (!ai) return "";
             
-            if (aiMemory[playerId].length > 15000) {
-                const mem = aiMemory[playerId];
-                aiMemory[playerId] = mem.substring(0, 2000) + "\n\n... [EARLIER MEMORY TRUNCATED] ...\n\n" + mem.substring(mem.length - 10000);
-            }
-
-            const fullPrompt = `${aiMemory[playerId]}\nNEW PROMPT: ${prompt}\nRespond strictly in character.`;
-            
-            const isNightPrompt = prompt.toLowerCase().includes('tonight') || prompt.toLowerCase().includes('night');
+            const isNightPrompt = taskPrompt.toLowerCase().includes('tonight') || taskPrompt.toLowerCase().includes('night');
             if (ai.api === 'groq') {
                 await delay(isNightPrompt ? 5000 : 8000); 
             }
 
             let attempts = 0;
+            let validationError = "";
+            let finalOutput = "";
+
             while (isGameActive && attempts < 3) {
                 try {
                     attempts++;
+                    const fullPrompt = buildAIPrompt(ai, taskPrompt, getFormatGuide(taskType), validationError);
                     let text = "";
 
                     if (ai.api === 'groq') {
@@ -985,8 +1040,38 @@ The game has just begun. Nothing has happened yet. Nobody has spoken.\n`;
                         if (data.promptFeedback?.blockReason || data.candidates?.[0]?.finishReason === 'SAFETY') throw new Error("Response blocked by AI safety filters");
                         text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
                     }
-                    
-                    return text.trim();
+
+                    // Strict Validation Loop
+                    if (taskType === 'vote') {
+                        const match = text.match(/VOTE:\s*([A-Za-z0-9_ ]+)/i);
+                        if (!match) { validationError = "Missing 'VOTE: Name' syntax."; continue; }
+                        const targetName = match[1].trim().toLowerCase();
+                        if (targetName !== 'none' && !validTargetsArray.map(n=>n.toLowerCase()).includes(targetName)) {
+                            validationError = `Invalid target '${targetName}'. Must be one of: ${validTargetsArray.join(', ')} or 'None'. Do not target dead players.`; continue;
+                        }
+                    } else if (taskType === 'target') {
+                        const match = text.match(/TARGET:\s*([A-Za-z0-9_ ]+)/i);
+                        if (!match) { validationError = "Missing 'TARGET: Name' syntax."; continue; }
+                        const targetName = match[1].trim().toLowerCase();
+                        if (targetName !== 'none' && !validTargetsArray.map(n=>n.toLowerCase()).includes(targetName)) {
+                            validationError = `Invalid target '${targetName}'. Must be one of: ${validTargetsArray.join(', ')} or 'None'. Do not target dead players.`; continue;
+                        }
+                    } else if (taskType === 'guess') {
+                        const match = text.match(/GUESS:\s*(Yes|No)/i);
+                        if (!match) { validationError = "Missing 'GUESS: Yes' or 'GUESS: No' syntax."; continue; }
+                    } else if (taskType === 'assassinate') {
+                        const match = text.match(/ASSASSINATE:\s*([A-Za-z0-9_ ]+)(?:\s*-\s*([A-Za-z0-9_ ]+))?/i);
+                        if (!match) { validationError = "Missing 'ASSASSINATE: Name - Role' syntax."; continue; }
+                        const targetName = match[1].trim().toLowerCase();
+                        if (targetName !== 'none' && !validTargetsArray.map(n=>n.toLowerCase()).includes(targetName)) {
+                            validationError = `Invalid target '${targetName}'. Must be one of: ${validTargetsArray.join(', ')} or 'None'.`; continue;
+                        }
+                    } else if (taskType === 'chat') {
+                        if (!text.trim()) { validationError = "Response cannot be empty."; continue; }
+                    }
+
+                    finalOutput = text.trim();
+                    break;
                 } catch (err) {
                     console.warn(`[${ai.name}] API Error:`, err);
                     const agentLabel = isNightPrompt ? 'An agent' : ai.name;
@@ -1004,7 +1089,7 @@ The game has just begun. Nothing has happened yet. Nobody has spoken.\n`;
                     }
                 }
             }
-            return "";
+            return finalOutput;
         };
 
         const getHumanInput = (mode, promptText) => {
@@ -1046,13 +1131,15 @@ The game has just begun. Nothing has happened yet. Nobody has spoken.\n`;
                 if (isRoleVisible(sp)) activePlayer = sp.id; else activePlayer = null;
                 renderGameBoard();
                 
-                const otherAliveNames = players.filter(p => p.isAlive && p.id !== sp.id).map(p => p.name).join(', ');
+                const otherAliveNames = players.filter(p => p.isAlive && p.id !== sp.id).map(p => p.name);
                 const currentRoles = [...new Set(players.map(p => p.role))].join(', ');
 
                 let target = null;
                 let guessRole = '';
 
-                let res = await callAI(sp.id, `You can guess a player's exact role right now. If right, they are eliminated and you can assassinate again tomorrow. If wrong, they learn you are the Assassin and you LOSE this ability forever. You do NOT have to use it today; wait until you are certain. Valid targets: ${otherAliveNames}. Possible roles: ${currentRoles}. If you want to use it, say EXACTLY "ASSASSINATE: [Name] - [Role]". To save it, say EXACTLY "ASSASSINATE: None".`);
+                let promptTask = `You can guess a player's exact role right now. If right, they are eliminated and you can assassinate again tomorrow. If wrong, they learn you are the Assassin and you LOSE this ability forever. You do NOT have to use it today; wait until you are certain. Valid targets: ${otherAliveNames.join(', ')}. Possible roles: ${currentRoles}.`;
+                
+                let res = await callAI(sp.id, promptTask, 'assassinate', otherAliveNames);
                 window.addLog(`(Internal thought): ${res}`, ['moderator', 'Mafia'], null, sp.name);
                 const match = res.match(/ASSASSINATE:\s*([A-Za-z0-9_ ]+)\s*-\s*([A-Za-z0-9_ ]+)/i);
                 if (match && match[1].toLowerCase().trim() !== 'none') {
@@ -1062,6 +1149,7 @@ The game has just begun. Nothing has happened yet. Nobody has spoken.\n`;
                 }
 
                 if (target && guessRole) {
+                    aiMemory[sp.id].actionHistory.push(`Day ${gameDay}: Attempted to assassinate ${target.name} as a ${guessRole}.`);
                     if (target.role.toLowerCase() === guessRole.toLowerCase()) {
                         let dayDeaths = [];
                         killPlayer(target, dayDeaths, ' (Assassinated)');
@@ -1116,7 +1204,7 @@ The game has just begun. Nothing has happened yet. Nobody has spoken.\n`;
 
                     // 1. Mafia Discussion & Vote
                     const aliveMafia = players.filter(p => p.isAlive && getRoleAlignment(p.role) === 'Mafia');
-                    const validMafiaTargets = players.filter(p => p.isAlive && getRoleAlignment(p.role) !== 'Mafia').map(p => p.name).join(', ');
+                    const validMafiaTargets = players.filter(p => p.isAlive && getRoleAlignment(p.role) !== 'Mafia').map(p => p.name);
 
                     if (aliveMafia.length > 0) {
                         window.addLog('Mafia are discussing...', ['moderator'], 'lock');
@@ -1130,9 +1218,12 @@ The game has just begun. Nothing has happened yet. Nobody has spoken.\n`;
                             if (m.isHuman) {
                                 msg = await getHumanInput('chat', 'Discuss with fellow Mafia who to kill.');
                             } else {
-                                msg = await callAI(m.id, `Discuss with your fellow mafia who you should eliminate tonight. Valid targets are: ${validMafiaTargets}. Keep it to one short sentence.`);
+                                msg = await callAI(m.id, `Discuss with your fellow mafia who you should eliminate tonight. Valid targets are: ${validMafiaTargets.join(', ')}`, 'chat');
                             }
-                            if (msg) window.addLog(msg, ['Mafia', 'moderator'], null, m.name);
+                            if (msg) {
+                                window.addLog(msg, ['Mafia', 'moderator'], null, m.name);
+                                if(!m.isHuman) aiMemory[m.id].actionHistory.push(`Night ${day} Chat: ${msg}`);
+                            }
                             await gameDelay(4000, true);
                         }
 
@@ -1152,7 +1243,7 @@ The game has just begun. Nothing has happened yet. Nobody has spoken.\n`;
                                 if (voteTarget) window.addLog(`Voted to kill ${voteTarget}. "${explanation}"`, ['Mafia', 'moderator'], null, m.name);
                                 else window.addLog(`Abstained from voting. "${explanation}"`, ['Mafia', 'moderator'], null, m.name);
                             } else {
-                                let msg = await callAI(m.id, `Who do you vote to kill? Valid targets are: ${validMafiaTargets}. You MUST choose a specific NAME from this list. You can attach comments before your vote, but you MUST end your response exactly with "VOTE: [Name]".`);
+                                let msg = await callAI(m.id, `Who do you vote to kill? Valid targets are: ${validMafiaTargets.join(', ')}`, 'vote', validMafiaTargets);
                                 window.addLog(msg, ['Mafia', 'moderator'], null, m.name);
                                 const match = msg.match(/VOTE:\s*([A-Za-z0-9_ ]+)/i);
                                 if (match) {
@@ -1162,7 +1253,10 @@ The game has just begun. Nothing has happened yet. Nobody has spoken.\n`;
                                 }
                                 if (!voteTarget) voteTarget = players.find(p => p.isAlive && getRoleAlignment(p.role) !== 'Mafia')?.name;
                             }
-                            if (voteTarget) voteCounts[voteTarget] = (voteCounts[voteTarget] || 0) + 1;
+                            if (voteTarget) {
+                                voteCounts[voteTarget] = (voteCounts[voteTarget] || 0) + 1;
+                                if (!m.isHuman) aiMemory[m.id].actionHistory.push(`Night ${day}: Voted to kill ${voteTarget}.`);
+                            }
                             await gameDelay(4000, true);
                         }
                         
@@ -1189,8 +1283,8 @@ The game has just begun. Nothing has happened yet. Nobody has spoken.\n`;
                         if (isRoleVisible(sp)) activePlayer = sp.id; else activePlayer = null;
                         renderGameBoard();
                         
-                        const allAliveNames = players.filter(p => p.isAlive).map(p => p.name).join(', ');
-                        const otherAliveNames = players.filter(p => p.isAlive && p.id !== sp.id).map(p => p.name).join(', ');
+                        const allAliveNames = players.filter(p => p.isAlive).map(p => p.name);
+                        const otherAliveNames = players.filter(p => p.isAlive && p.id !== sp.id).map(p => p.name);
 
                         if (sp.role === 'Doctor') {
                             const lastProtectedPlayer = players.find(p => p.id === doctorLastProtectedId);
@@ -1214,7 +1308,7 @@ The game has just begun. Nothing has happened yet. Nobody has spoken.\n`;
                                     }
                                 }
                             } else {
-                                let res = await callAI(sp.id, `Who do you protect tonight? Valid targets: ${allAliveNames}. You CAN protect yourself. You CANNOT protect ${lastProtectedName} again. Choose a specific NAME. End your response with exactly "TARGET: [Name]".`);
+                                let res = await callAI(sp.id, `Who do you protect tonight? Valid targets: ${allAliveNames.join(', ')}. You CAN protect yourself. You CANNOT protect ${lastProtectedName} again.`, 'target', allAliveNames);
                                 window.addLog(`(Internal thought): ${res}`, ['moderator', sp.id], null, sp.name);
                                 const match = res.match(/TARGET:\s*([A-Za-z0-9_ ]+)/i);
                                 if (match) {
@@ -1224,6 +1318,7 @@ The game has just begun. Nothing has happened yet. Nobody has spoken.\n`;
                                         nightActions.protect = targetPlayer;
                                         nightActions.protectId = sp.id;
                                         doctorLastProtectedId = targetPlayer.id;
+                                        aiMemory[sp.id].actionHistory.push(`Night ${day}: Protected ${targetPlayer.name}.`);
                                     } else {
                                         window.addLog(`Doctor attempted an invalid protection and did nothing.`, ['moderator', sp.id], 'shield');
                                     }
@@ -1240,12 +1335,14 @@ The game has just begun. Nothing has happened yet. Nobody has spoken.\n`;
                                     nightActions.investigateId = sp.id;
                                 }
                             } else {
-                                let res = await callAI(sp.id, `Who do you investigate tonight? Valid targets: ${otherAliveNames}. Choose a specific NAME. End your response with exactly "TARGET: [Name]".`);
+                                let res = await callAI(sp.id, `Who do you investigate tonight? Valid targets: ${otherAliveNames.join(', ')}.`, 'target', otherAliveNames);
                                 window.addLog(`(Internal thought): ${res}`, ['moderator', sp.id], null, sp.name);
                                 const match = res.match(/TARGET:\s*([A-Za-z0-9_ ]+)/i);
                                 if (match) {
-                                    nightActions.investigate = players.find(p => p.name.toLowerCase() === match[1].trim().toLowerCase() && p.isAlive);
+                                    const targetPlayer = players.find(p => p.name.toLowerCase() === match[1].trim().toLowerCase() && p.isAlive);
+                                    nightActions.investigate = targetPlayer;
                                     nightActions.investigateId = sp.id;
+                                    if (targetPlayer) aiMemory[sp.id].actionHistory.push(`Night ${day}: Investigated ${targetPlayer.name}.`);
                                 }
                             }
                         }
@@ -1255,12 +1352,15 @@ The game has just begun. Nothing has happened yet. Nobody has spoken.\n`;
                                 let targetId = await getHumanInput('target', 'Select a player to BOND with. If they die, you die. If they win, you win.');
                                 if (targetId !== 'skip' && targetId !== sp.id) sp.loverBond = targetId;
                             } else {
-                                let res = await callAI(sp.id, `It is Night 1. You must choose a player to bond with. If they die, you die. If they win, you win. Valid targets: ${otherAliveNames}. End your response with exactly "TARGET: [Name]".`);
+                                let res = await callAI(sp.id, `It is Night 1. You must choose a player to bond with. If they die, you die. If they win, you win. Valid targets: ${otherAliveNames.join(', ')}.`, 'target', otherAliveNames);
                                 window.addLog(`(Internal thought): ${res}`, ['moderator', sp.id], null, sp.name);
                                 const match = res.match(/TARGET:\s*([A-Za-z0-9_ ]+)/i);
                                 if (match) {
                                     const t = players.find(p => p.name.toLowerCase() === match[1].trim().toLowerCase() && p.isAlive);
-                                    if (t) sp.loverBond = t.id;
+                                    if (t) {
+                                        sp.loverBond = t.id;
+                                        aiMemory[sp.id].actionHistory.push(`Night 1: Bonded with ${t.name}.`);
+                                    }
                                 }
                             }
                             if (sp.loverBond) window.addLog(`Lover bonded with ${players.find(p=>p.id===sp.loverBond).name}.`, ['moderator', sp.id], 'heart');
@@ -1274,12 +1374,13 @@ The game has just begun. Nothing has happened yet. Nobody has spoken.\n`;
                                     sp.hasGuess = false;
                                 }
                             } else {
-                                let res = await callAI(sp.id, `You have a one-time ability to guess if you will be targeted by ANY role tonight. If right, you win immediately. If wrong, you are eliminated. You do NOT have to use it tonight; you can save it. Do you use it tonight? Say EXACTLY "GUESS: Yes" or "GUESS: No".`);
+                                let res = await callAI(sp.id, `You have a one-time ability to guess if you will be targeted by ANY role tonight. If right, you win immediately. If wrong, you are eliminated. You do NOT have to use it tonight; you can save it. Do you use it tonight?`, 'guess');
                                 window.addLog(`(Internal thought): ${res}`, ['moderator', sp.id], null, sp.name);
                                 const match = res.match(/GUESS:\s*(Yes|No)/i);
                                 if (match && match[1].toLowerCase() === 'yes') {
                                     nightActions.guesserActive = true;
                                     sp.hasGuess = false;
+                                    aiMemory[sp.id].actionHistory.push(`Night ${day}: Used Guesser ability.`);
                                 }
                             }
                             if (nightActions.guesserActive) window.addLog(`Guesser locked in their prediction for tonight!`, ['moderator', sp.id], 'dices');
@@ -1293,12 +1394,16 @@ The game has just begun. Nothing has happened yet. Nobody has spoken.\n`;
                                     sp.jailUses--;
                                 }
                             } else {
-                                let res = await callAI(sp.id, `You have ${sp.jailUses} jail use(s) left for the game. Jailing blocks a player's night action and mutes them tomorrow. Use this tactically to silence important players or stop investigations! You do NOT have to use it tonight. Valid targets: ${otherAliveNames}. Choose a specific NAME. If you want to use it, end with "TARGET: [Name]". If you want to save it, say EXACTLY "TARGET: None".`);
+                                let res = await callAI(sp.id, `You have ${sp.jailUses} jail use(s) left for the game. Jailing blocks a player's night action and mutes them tomorrow. Use this tactically to silence important players or stop investigations! You do NOT have to use it tonight. Valid targets: ${otherAliveNames.join(', ')}.`, 'target', otherAliveNames);
                                 window.addLog(`(Internal thought): ${res}`, ['moderator', 'Mafia'], null, sp.name);
                                 const match = res.match(/TARGET:\s*([A-Za-z0-9_ ]+)/i);
                                 if (match && match[1].toLowerCase().trim() !== 'none') {
-                                    nightActions.jail = players.find(p => p.name.toLowerCase() === match[1].trim().toLowerCase() && p.isAlive);
-                                    sp.jailUses--;
+                                    const t = players.find(p => p.name.toLowerCase() === match[1].trim().toLowerCase() && p.isAlive);
+                                    if (t) {
+                                        nightActions.jail = t;
+                                        sp.jailUses--;
+                                        aiMemory[sp.id].actionHistory.push(`Night ${day}: Jailed ${t.name}.`);
+                                    }
                                 }
                             }
                             if (nightActions.jail) window.addLog(`Jailor jailed ${nightActions.jail.name}.`, ['Mafia', 'moderator'], 'lock');
@@ -1312,12 +1417,16 @@ The game has just begun. Nothing has happened yet. Nobody has spoken.\n`;
                                     sp.hasErase = false;
                                 }
                             } else {
-                                let res = await callAI(sp.id, `You have 1 erase use left for the ENTIRE game. Erasing turns a player into a Vanilla Town. You do NOT have to use it tonight; you can save it. Valid targets: ${otherAliveNames}. Choose a specific NAME. If you want to use it, end with "TARGET: [Name]". If you want to save it, say EXACTLY "TARGET: None".`);
+                                let res = await callAI(sp.id, `You have 1 erase use left for the ENTIRE game. Erasing turns a player into a Vanilla Town. You do NOT have to use it tonight; you can save it. Valid targets: ${otherAliveNames.join(', ')}.`, 'target', otherAliveNames);
                                 window.addLog(`(Internal thought): ${res}`, ['moderator', 'Mafia'], null, sp.name);
                                 const match = res.match(/TARGET:\s*([A-Za-z0-9_ ]+)/i);
                                 if (match && match[1].toLowerCase().trim() !== 'none') {
-                                    nightActions.erase = players.find(p => p.name.toLowerCase() === match[1].trim().toLowerCase() && p.isAlive);
-                                    sp.hasErase = false;
+                                    const t = players.find(p => p.name.toLowerCase() === match[1].trim().toLowerCase() && p.isAlive);
+                                    if(t) {
+                                        nightActions.erase = t;
+                                        sp.hasErase = false;
+                                        aiMemory[sp.id].actionHistory.push(`Night ${day}: Attempted to Erase ${t.name}.`);
+                                    }
                                 }
                             }
                             if (nightActions.erase) window.addLog(`Eraser targeted ${nightActions.erase.name}.`, ['Mafia', 'moderator'], 'eraser');
@@ -1332,13 +1441,17 @@ The game has just begun. Nothing has happened yet. Nobody has spoken.\n`;
                                     sp.hasBullet = false;
                                 }
                             } else {
-                                let res = await callAI(sp.id, `You have a gun with 1 bullet for the ENTIRE game. You do NOT have to shoot tonight; you can save it. Valid targets: ${otherAliveNames}. Choose a specific NAME. If you want to shoot, end with "TARGET: [Name]". If you want to save it, say EXACTLY "TARGET: None".`);
+                                let res = await callAI(sp.id, `You have a gun with 1 bullet for the ENTIRE game. You do NOT have to shoot tonight; you can save it. Valid targets: ${otherAliveNames.join(', ')}.`, 'target', otherAliveNames);
                                 window.addLog(`(Internal thought): ${res}`, ['moderator', sp.id], null, sp.name);
                                 const match = res.match(/TARGET:\s*([A-Za-z0-9_ ]+)/i);
                                 if (match && match[1].toLowerCase().trim() !== 'none') {
-                                    nightActions.shoot = players.find(p => p.name.toLowerCase() === match[1].trim().toLowerCase() && p.isAlive);
-                                    nightActions.shootId = sp.id;
-                                    sp.hasBullet = false;
+                                    const t = players.find(p => p.name.toLowerCase() === match[1].trim().toLowerCase() && p.isAlive);
+                                    if(t) {
+                                        nightActions.shoot = t;
+                                        nightActions.shootId = sp.id;
+                                        sp.hasBullet = false;
+                                        aiMemory[sp.id].actionHistory.push(`Night ${day}: Shot ${t.name}.`);
+                                    }
                                 }
                             }
                         }
@@ -1473,7 +1586,7 @@ The game has just begun. Nothing has happened yet. Nobody has spoken.\n`;
                             if (p.isHuman) {
                                 msg = await getHumanInput('chat', 'What do you have to say to the town?');
                             } else {
-                                msg = await callAI(p.id, `It is day time discussion. What do you say to the group? Remember to defend yourself, accuse others, or share information carefully.`);
+                                msg = await callAI(p.id, `It is day time discussion. What do you say to the group? Remember to defend yourself, accuse others, or share information carefully.`, 'chat');
                             }
                             if (msg) window.addLog(msg, ['all'], null, p.name);
                             await gameDelay(5000, false);
@@ -1489,6 +1602,7 @@ The game has just begun. Nothing has happened yet. Nobody has spoken.\n`;
                     window.addLog(`It is time to vote.`, ['all']);
                     let dayVotes = {};
                     const aliveVoters = players.filter(p => p.isAlive);
+                    const validDayTargets = aliveVoters.map(v => v.name);
 
                     for (let p of aliveVoters) {
                         if (!isGameActive) return;
@@ -1502,8 +1616,6 @@ The game has just begun. Nothing has happened yet. Nobody has spoken.\n`;
                             continue;
                         }
                         
-                        const validDayTargets = aliveVoters.filter(v => v.id !== p.id).map(v => v.name).join(', ');
-
                         if (p.isHuman) {
                             let targetId = await getHumanInput('target', 'Select a player to VOTE OUT.');
                             if (targetId !== 'skip' && targetId !== p.id) {
@@ -1513,7 +1625,7 @@ The game has just begun. Nothing has happened yet. Nobody has spoken.\n`;
                             if (voteTarget) window.addLog(`Voted for ${voteTarget}. "${explanation}"`, ['all'], null, p.name);
                             else window.addLog(`Abstained from voting. "${explanation}"`, ['all'], null, p.name);
                         } else {
-                            let msg = await callAI(p.id, `Who do you vote to eliminate? Valid targets are: ${validDayTargets}. You can attach comments or explanations before your vote, but you MUST END your response EXACTLY with "VOTE: [Name]" or "VOTE: None". Do NOT vote for a role.`);
+                            let msg = await callAI(p.id, `Who do you vote to eliminate? Valid targets are: ${validDayTargets.join(', ')}.`, 'vote', validDayTargets);
                             window.addLog(msg, ['all'], null, p.name);
                             const match = msg.match(/VOTE:\s*([A-Za-z0-9_ ]+)/i);
                             if (match && match[1].toLowerCase().trim() !== 'none') {
@@ -1522,6 +1634,7 @@ The game has just begun. Nothing has happened yet. Nobody has spoken.\n`;
                         }
                         if (voteTarget) {
                             dayVotes[voteTarget] = (dayVotes[voteTarget] || 0) + 1;
+                            if(!p.isHuman) aiMemory[p.id].actionHistory.push(`Day ${day}: Voted for ${voteTarget}.`);
                         }
                         await gameDelay(5000, false);
                     }
@@ -1601,7 +1714,7 @@ The game has just begun. Nothing has happened yet. Nobody has spoken.\n`;
                             let msg = await getHumanInput('chat', 'Game Over! Enter your final closing statement / trash talk:');
                             if (msg) window.addLog(msg, ['all'], null, p.name);
                         } else {
-                            let msg = await callAI(p.id, `The game is over. The winner is: ${finalWinnerString}. Give one final short, in-character closing statement, reaction, or trash talk. Limit to 1 sentence.`);
+                            let msg = await callAI(p.id, `The game is over. The winner is: ${finalWinnerString}. Give one final short, in-character closing statement, reaction, or trash talk. Limit to 1 sentence.`, 'chat');
                             if (msg) window.addLog(msg, ['all'], null, p.name);
                         }
                         await gameDelay(3000, false);
