@@ -585,6 +585,30 @@
         // ==========================================
         // GAME VIEW & ENGINE
         // ==========================================
+        
+        const addLog = (text, visibility = ['all'], icon = null, speakerName = null) => {
+            const newLog = { id: Math.random(), text, visibility, icon, speakerName };
+            logs.push(newLog);
+            
+            players.filter(p => !p.isHuman && p.isAlive).forEach(ai => {
+                const align = getRoleAlignment(ai.role);
+                const canSee = visibility.includes('all') || visibility.includes(ai.id) || (visibility.includes('Mafia') && align === 'Mafia');
+                if (canSee) {
+                    let prefix = speakerName ? `${speakerName}: ` : `EVENT: `;
+                    aiMemory[ai.id] += `${prefix}${text}\n`;
+                }
+            });
+            
+            window.appendLogToDOM(newLog);
+        };
+        window.addLog = addLog;
+        
+        const syncUI = () => {
+            renderGameBoard();
+            renderModeratorPanel();
+        };
+        window.syncUI = syncUI;
+
         window.abortGame = () => {
             isGameActive = false;
             appState = 'lobby';
@@ -598,7 +622,7 @@
 
         window.handleChatInputSubmit = () => {
             if (chatInputValue.trim()) {
-                submitHumanInput(chatInputValue);
+                window.submitHumanInput(chatInputValue);
                 chatInputValue = '';
             }
         };
@@ -610,7 +634,7 @@
         window.handleAvatarClick = (id) => {
             if (humanInputMode === 'target') {
                 const p = players.find(x=>x.id===id);
-                if (p && p.isAlive) submitHumanInput(id);
+                if (p && p.isAlive) window.submitHumanInput(id);
             }
         };
 
@@ -822,26 +846,6 @@
             
             lucide.createIcons({ root: panel });
         }
-
-        window.exportLogs = () => {
-            let exportText = "MACHINE MAFIA - MATCH LOGS\n==========================\n\n";
-            logs.forEach(log => {
-                const isVisibleToHuman = isLogVisible(log);
-                const prefix = !isVisibleToHuman ? "[DIDN'T SEE] " : "";
-                const speaker = log.speakerName ? `${log.speakerName}: ` : "EVENT: ";
-                exportText += `${prefix}${speaker}${log.text}\n`;
-            });
-            
-            const blob = new Blob([exportText], { type: "text/plain" });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement("a");
-            a.href = url;
-            a.download = "machine_mafia_logs.txt";
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            URL.revokeObjectURL(url);
-        };
 
         function renderGame() {
             return `
