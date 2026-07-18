@@ -42,20 +42,21 @@
             { emoji: '🐯', bg: 'bg-orange-600/20', border: 'border-orange-600/50' }
         ];
 
+        // Rewritten for concise bullet points in local model prompts
         const ROLE_DESCRIPTIONS = {
-            'Town': 'A standard Town member with no special power but has a vote during the day to find the Mafia.',
-            'Doctor': 'A Town special role who can protect one player from elimination each night.',
-            'Detective': 'A Town special role who can investigate one player each night to learn if they are Mafia or not.',
-            'Vigilante': 'A Town special role who has one single bullet to shoot a suspected player at night.',
-            'Spy': 'A Town special role who secretly learns the count of unique roles remaining in the game each night.',
-            'Indecisive': 'A Town member whose identity is publicly revealed on Day 1, but they are completely unable to vote.',
-            'Mafia': 'A standard Mafia member who votes with the Mafia team each night to eliminate Town members.',
-            'Jailor': 'A Mafia special role who can block a player\'s ability at night and mute them during the next day (two uses per game).',
-            'Eraser': 'A Mafia special role who can permanently erase someone\'s role (turns them into Vanilla Town). Can be blocked by Doctor.',
-            'Jester': 'A Neutral player whose sole objective is to trick the town into voting them out during the day.',
-            'Lover': 'A Neutral player who bonds with someone on Night 1. If their bond dies, they die. If their bond wins, they win.',
-            'Guesser': 'A Neutral risk-taker. Once per game, guess that you will be targeted that night. If right: Win. If wrong: Eliminated.',
-            'Assassin': 'A Mafia special role who can guess a player\'s role during the day. If correct, the target is eliminated and the Assassin can guess again on future days. If wrong, the target learns the Assassin\'s identity and the power is permanently lost.'
+            'Town': 'No special ability. Votes during the day.',
+            'Doctor': 'May protect one player each night from elimination.',
+            'Detective': 'Investigates one player each night to learn if they are Mafia or not.',
+            'Vigilante': 'Has one single bullet to shoot a suspected player at night.',
+            'Spy': 'Secretly learns the count of unique roles remaining in the game each night.',
+            'Indecisive': 'Identity is publicly revealed on Day 1, but is completely unable to vote.',
+            'Mafia': 'Votes with the Mafia team each night to eliminate Town members. Knows every living Mafia member.',
+            'Jailor': 'Can block a player\'s ability at night and mute them during the next day (two uses per game).',
+            'Eraser': 'Can permanently erase someone\'s role (turns them into Vanilla Town). Can be blocked by Doctor.',
+            'Jester': 'Sole objective is to trick the town into voting them out during the day.',
+            'Lover': 'Bonds with someone on Night 1. If their bond dies, they die. If their bond wins, they win.',
+            'Guesser': 'Once per game, guess that you will be targeted that night. If right: Win. If wrong: Eliminated.',
+            'Assassin': 'Can guess a player\'s role during the day. Correct: target eliminated. Wrong: target learns Assassin\'s identity and power is lost.'
         };
 
         // ==========================================
@@ -93,7 +94,7 @@
 
         // Engine Internals (STRUCTURED AI MEMORY)
         let isGameActive = false;
-        let aiMemory = {}; // Will hold { privateKnowledge: [], actionHistory: [] }
+        let aiMemory = {}; // Holds { privateKnowledge: [], actionHistory: [] } per player
         let publicEvents = []; // Public facts array
         let recentDiscussion = []; // Rolling array of recent chats
         let humanResolve = null;
@@ -108,7 +109,7 @@
         };
 
         // ==========================================
-        // UTILS
+        // UTILS & PROMPT BUILDERS
         // ==========================================
         const getRoleAlignment = (roleName) => {
             if (['Jailor', 'Eraser', 'Assassin', 'Mafia'].includes(roleName)) return 'Mafia';
@@ -139,12 +140,97 @@
         const isSetupValid = () => geminiApiKey.trim() || groqApiKey.trim() || mistralApiKey.trim() || useOllama;
 
         const getFormatGuide = (taskType) => {
-            if (taskType === 'chat') return "One natural discussion message.\nNothing else.\nDo not vote or act.\nDo not use *actions* or markdown.";
+            if (taskType === 'chat') return "One natural discussion message.\nNothing else.";
             if (taskType === 'vote') return "Reasoning...\n\nVOTE: PlayerName\n(Or VOTE: None)";
             if (taskType === 'target') return "Reasoning...\n\nTARGET: PlayerName\n(Or TARGET: None)";
             if (taskType === 'guess') return "Reasoning...\n\nGUESS: Yes\n(Or GUESS: No)";
             if (taskType === 'assassinate') return "Reasoning...\n\nASSASSINATE: PlayerName - RoleName\n(Or ASSASSINATE: None)";
             return "";
+        };
+
+        const getObjectiveText = (player) => {
+            const align = getRoleAlignment(player.role);
+            if (align === 'Mafia') {
+                const aliveMafia = players.filter(p => p.isAlive && getRoleAlignment(p.role) === 'Mafia').map(p => p.name).join(', ');
+                return `Your objective:\nRemain hidden until the Mafia equal or outnumber the remaining Town.\nYou know the identities of every living Mafia member: ${aliveMafia}.\nYou may lie.\nYou may bluff.\nYou may accuse innocent players.\nYou may defend yourself.\nChoose whatever strategy you believe gives your team the best chance of winning.`;
+            } else if (align === 'Neutral') {
+                if (player.role === 'Jester') return `Your objective:\nTrick the town into voting you out during the day.\nAct suspiciously, but do not be too obvious.\nChoose your own strategy.`;
+                if (player.role === 'Lover') return `Your objective:\nSurvive with your bonded partner. If they win, you win. If they die, you die.\nChoose your own strategy.`;
+                if (player.role === 'Guesser') return `Your objective:\nSurvive and successfully use your one-time guess.\nChoose your own strategy.`;
+            } else {
+                return `Your objective:\nHelp eliminate every Mafia member.\nYou may accuse, defend, question, bluff about suspicions, or stay cautious.\nChoose your own strategy.`;
+            }
+        };
+
+        const buildAIPrompt = (player, taskPrompt, formatGuide, repromptError = "") => {
+            const alivePlayers = players.filter(p => p.isAlive).map(p => p.name);
+            const deadPlayers = players.filter(p => !p.isAlive).map(p => p.name);
+            const activeRolesInGame = [...new Set(players.map(p => p.role))];
+            
+            const rolesListText = activeRolesInGame.map(r => `• ${r}\n  - ${ROLE_DESCRIPTIONS[r] || 'No special ability.'}`).join('\n\n');
+            const align = getRoleAlignment(player.role);
+            const mem = aiMemory[player.id];
+            const objectiveText = getObjectiveText(player);
+            
+            let prompt = `You are ${player.name}.
+Your role is ${player.role} (${align}).
+You are currently alive.
+
+Everything below describes the current game state.
+
+ROLES AT THE START OF THIS MATCH:
+${rolesListText}
+
+Some of these roles may now belong to dead players. Do not assume every role is still alive.
+
+YOUR ROLE & OBJECTIVE:
+${objectiveText}
+
+CURRENT TIME
+Day: ${gameDay}
+Phase: ${gamePhase}
+
+Everything below has already happened. Nothing after this point has happened yet.
+
+RULES & CONSTRAINTS
+- Moderator facts are always true.
+- Player statements are not guaranteed to be true. Players may lie, bluff, or be mistaken. Reason accordingly.
+- Never invent moderator events. Do not invent: deaths, investigations, role reveals, vote results, eliminations, protected targets, hidden information, or actions that have already occurred.
+- You are encouraged to invent: opinions, suspicions, accusations, defenses, theories, lies, bluffs, and strategies provided they do not contradict the moderator's structured information.
+- Speak naturally. Do not explain what you are about to do. Do not narrate your reasoning process. Do not describe following instructions. Simply speak as your character.
+- Conversational examples: "I don't think we have enough information yet.", "That accusation feels premature.", "I'd like to hear more from Solstice.", "I disagree with that conclusion."
+
+MODERATOR FACTS
+Alive Players (${alivePlayers.length}):
+${alivePlayers.length ? '- ' + alivePlayers.join('\n- ') : 'None'}
+
+Dead Players:
+${deadPlayers.length ? '- ' + deadPlayers.join('\n- ') : 'None'}
+
+Public Events:
+${publicEvents.length ? publicEvents.map(e => '- ' + e).join('\n') : '- Nothing has happened yet.'}
+
+YOUR MEMORY (Private Knowledge)
+${mem.privateKnowledge.length ? mem.privateKnowledge.map(e => '- ' + e).join('\n') : '- Nothing yet.'}
+
+YOUR ACTIONS (History)
+${mem.actionHistory.length ? mem.actionHistory.map(e => '- ' + e).join('\n') : '- No actions taken yet.'}
+
+RECENT DISCUSSION
+${recentDiscussion.length ? recentDiscussion.join('\n') : 'No recent discussion.'}
+
+YOUR TASK
+${taskPrompt}
+
+OUTPUT FORMAT REQUIRED:
+${formatGuide}
+`;
+
+            if (repromptError) {
+                prompt += `\n\nERROR ON PREVIOUS ATTEMPT:\n${repromptError}\nYou MUST correct this and follow the requested format exactly!`;
+            }
+
+            return prompt;
         };
 
         // ==========================================
@@ -906,27 +992,9 @@
             
             render();
 
-            const activeRolesInGame = [...new Set(players.map(p => p.role))];
-            const rolesListText = activeRolesInGame.map(r => `- ${r}: ${ROLE_DESCRIPTIONS[r] || 'An unknown role.'}`).join('\n');
-            const mafiaNames = players.filter(p => getRoleAlignment(p.role) === 'Mafia').map(p => p.name).join(', ');
-            const indecisives = players.filter(p => p.role === 'Indecisive').map(p => p.name).join(', ');
-
-            const jesterRuleText = activeRolesInGame.includes('Jester') ? '\nCRITICAL NOTICE: There is a Jester in this match! The Jester only wins if they successfully trick everyone into voting them out. Do not easily fall for players acting suspiciously on purpose just to get executed.' : '';
-            const independentActionDirective = '\nINDEPENDENCE PRINCIPLE: You can and should make independent decisions IF you disagree with the group\'s opinions or the consensus. You do not have to follow the crowd, and sometimes breaking away from standard consensus is highly advised to find the truth or protect your faction.';
-
             players.forEach(p => {
                 if (!p.isHuman) {
-                    let align = getRoleAlignment(p.role);
-                    let extraRules = "";
-                    if (align === 'Mafia') extraRules = `\nYour fellow Mafia members are: ${mafiaNames}. You CANNOT target them. You must eliminate the Town.`;
-                    else if (p.role === 'Doctor') extraRules = `\nYou can protect yourself, but you CANNOT protect the exact same person two nights in a row.`;
-                    else if (p.role === 'Indecisive') extraRules = `\nEveryone knows you are Town, but you cannot vote.`;
-                    else extraRules = `\nYou do not know who anyone else is.`;
-
-                    let knownPublicInfo = indecisives ? `PUBLIC KNOWLEDGE: Everyone knows that ${indecisives} is the Indecisive, and is 100% confirmed Town.` : '';
-
                     aiMemory[p.id] = {
-                        systemBase: `SYSTEM INSTRUCTIONS\nYou are playing a text-based game of Mafia as an AI.\nName: ${p.name}\nRole: ${p.role} (${align})\nPlaystyle constraint: ${p.playstyle || 'Play logically and naturally.'}\n\nCRITICAL RULES:\n- The moderator's structured information is always correct. Never contradict it.\n- Never invent deaths, investigations, attacks, votes, discussions, role claims, relationships, or conversations.\n- If something is not listed in the provided information, assume it never happened.\n- Do not use *asterisks* or markdown for actions. Just speak naturally.\n- Only living players can act or speak.${extraRules}${jesterRuleText}${independentActionDirective}\n\nTHE FOLLOWING ROLES ARE ACTIVE IN THIS MATCH:\n${rolesListText}\n\n${knownPublicInfo}`,
                         privateKnowledge: [],
                         actionHistory: []
                     };
@@ -936,53 +1004,20 @@
             runGameLoop();
         };
 
-        const buildAIPrompt = (player, taskPrompt, formatGuide, repromptError = "") => {
-            const alivePlayers = players.filter(p => p.isAlive).map(p => p.name);
-            const deadPlayers = players.filter(p => !p.isAlive).map(p => p.name);
-            
-            const mem = aiMemory[player.id];
-            
-            let prompt = `${mem.systemBase}
-
-CURRENT GAME STATE
-Current Day: ${gameDay}
-Current Phase: ${gamePhase}
-
-Alive Players (${alivePlayers.length}):
-${alivePlayers.length ? alivePlayers.map(n => '- ' + n).join('\n') : 'None'}
-
-Dead Players:
-${deadPlayers.length ? deadPlayers.map(n => '- ' + n).join('\n') : 'None'}
-
-PUBLIC FACTS
-${publicEvents.length ? publicEvents.map(e => '- ' + e).join('\n') : '- Nothing has happened yet.'}
-
-YOUR MEMORY (Private Knowledge)
-${mem.privateKnowledge.length ? mem.privateKnowledge.map(e => '- ' + e).join('\n') : '- Nothing yet.'}
-
-YOUR ACTIONS (History)
-${mem.actionHistory.length ? mem.actionHistory.map(e => '- ' + e).join('\n') : '- No actions taken yet.'}
-
-RECENT DISCUSSION
-${recentDiscussion.length ? recentDiscussion.join('\n') : 'No recent discussion.'}
-
-YOUR TASK
-${taskPrompt}
-
-OUTPUT FORMAT REQUIRED:
-${formatGuide}
-`;
-
-            if (repromptError) {
-                prompt += `\n\nERROR ON PREVIOUS ATTEMPT:\n${repromptError}\nYou MUST correct this and follow the requested format exactly!`;
-            }
-
-            return prompt;
-        };
-
         const callAI = async (playerId, taskPrompt, taskType, validTargetsArray = []) => {
             const ai = players.find(p => p.id === playerId);
             if (!ai) return "";
+            
+            // Safety: Truncate arrays if they get too large
+            if (aiMemory[playerId].privateKnowledge.length > 25) {
+                aiMemory[playerId].privateKnowledge = aiMemory[playerId].privateKnowledge.slice(-25);
+            }
+            if (aiMemory[playerId].actionHistory.length > 25) {
+                aiMemory[playerId].actionHistory = aiMemory[playerId].actionHistory.slice(-25);
+            }
+            if (publicEvents.length > 40) {
+                publicEvents = publicEvents.slice(-40);
+            }
             
             const isNightPrompt = taskPrompt.toLowerCase().includes('tonight') || taskPrompt.toLowerCase().includes('night');
             if (ai.api === 'groq') {
@@ -1218,11 +1253,10 @@ ${formatGuide}
                             if (m.isHuman) {
                                 msg = await getHumanInput('chat', 'Discuss with fellow Mafia who to kill.');
                             } else {
-                                msg = await callAI(m.id, `Discuss with your fellow mafia who you should eliminate tonight. Valid targets are: ${validMafiaTargets.join(', ')}`, 'chat');
+                                msg = await callAI(m.id, `Discuss with your fellow mafia who you should eliminate tonight. Valid targets are: ${validMafiaTargets.join(', ')}. Write exactly one private discussion message. Do not vote yet.`, 'chat');
                             }
                             if (msg) {
                                 window.addLog(msg, ['Mafia', 'moderator'], null, m.name);
-                                if(!m.isHuman) aiMemory[m.id].actionHistory.push(`Night ${day} Chat: ${msg}`);
                             }
                             await gameDelay(4000, true);
                         }
@@ -1243,7 +1277,7 @@ ${formatGuide}
                                 if (voteTarget) window.addLog(`Voted to kill ${voteTarget}. "${explanation}"`, ['Mafia', 'moderator'], null, m.name);
                                 else window.addLog(`Abstained from voting. "${explanation}"`, ['Mafia', 'moderator'], null, m.name);
                             } else {
-                                let msg = await callAI(m.id, `Who do you vote to kill? Valid targets are: ${validMafiaTargets.join(', ')}`, 'vote', validMafiaTargets);
+                                let msg = await callAI(m.id, `Who do you vote to kill? Valid targets are: ${validMafiaTargets.join(', ')}.`, 'vote', validMafiaTargets);
                                 window.addLog(msg, ['Mafia', 'moderator'], null, m.name);
                                 const match = msg.match(/VOTE:\s*([A-Za-z0-9_ ]+)/i);
                                 if (match) {
@@ -1586,7 +1620,7 @@ ${formatGuide}
                             if (p.isHuman) {
                                 msg = await getHumanInput('chat', 'What do you have to say to the town?');
                             } else {
-                                msg = await callAI(p.id, `It is day time discussion. What do you say to the group? Remember to defend yourself, accuse others, or share information carefully.`, 'chat');
+                                msg = await callAI(p.id, `Write exactly one public discussion message. Defend yourself, accuse others, or share information. Do not vote. Do not perform any actions. Do not include internal thoughts.`, 'chat');
                             }
                             if (msg) window.addLog(msg, ['all'], null, p.name);
                             await gameDelay(5000, false);
