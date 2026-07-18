@@ -37,7 +37,7 @@
             { emoji: '🐉', bg: 'bg-emerald-500/20', border: 'border-emerald-500/50' },
             { emoji: '🐙', bg: 'bg-indigo-500/20', border: 'border-indigo-500/50' },
             { emoji: '🦁', bg: 'bg-yellow-500/20', border: 'border-yellow-500/50' },
-            { emoji: '🐼', bg: 'bg-zinc-500/20', border: 'bg-zinc-500/50' },
+            { emoji: '🐼', bg: 'bg-zinc-500/20', border: 'border-zinc-500/50' },
             { emoji: '🐸', bg: 'bg-lime-500/20', border: 'border-lime-500/50' },
             { emoji: '🐯', bg: 'bg-orange-600/20', border: 'border-orange-600/50' }
         ];
@@ -193,7 +193,8 @@ RULES & CONSTRAINTS
 - Never invent moderator events. Do not invent: deaths, investigations, role reveals, vote results, eliminations, protected targets, hidden information, or actions that have already occurred.
 - You are encouraged to invent: opinions, suspicions, accusations, defenses, theories, lies, bluffs, and strategies provided they do not contradict the moderator's structured information.
 - Speak naturally. Do not explain what you are about to do. Do not narrate your reasoning process. Do not describe following instructions. Simply speak as your character.
-- Conversational examples: "I don't think we have enough information yet.", "That accusation feels premature.", "I'd like to hear more from Solstice.", "I disagree with that conclusion."
+- Avoid repeating generic agreements. Answer questions, challenge evidence, ask follow-up questions, and advance the conversation.
+- You do not know who holds hidden roles. Do not assume anyone is a Priest unless they revive publicly.
 
 MODERATOR FACTS
 Alive Players (${alivePlayers.length}):
@@ -942,35 +943,63 @@ ${formatGuide}
             runGameLoop();
         };
 
-        const getSpeakScore = async (player) => {
-            const recent = recentDiscussion.slice(-6).join('\n');
-            const prompt = `You are ${player.name}, a ${player.role}.\nRecent discussion:\n${recent ? recent : "None yet."}\n\nBased on your role, personality, and the recent discussion, how urgently do you want to speak right now? Respond with ONLY a single integer between 0 and 100.\n0 = I do not want to speak.\n100 = I urgently want to speak.`;
-
-            let score = 0;
-            if (useLocalSpeakModel) {
-                try {
-                    const response = await fetch('http://127.0.0.1:11434/api/chat', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ model: 'smollm2:135m', messages: [{ role: 'user', content: prompt }], stream: false })
-                    });
-                    const data = await response.json();
-                    let text = data.message?.content || "";
-                    let match = text.match(/\d+/);
-                    if (match) score = parseInt(match[0]);
-                } catch (e) {
-                    console.warn("Ollama speaking score error:", e);
-                }
-            } else {
-                score = Math.floor(Math.random() * 100);
+        const getNextSpeaker = async (eligiblePlayers, visibility) => {
+            if (!useLocalSpeakModel) {
+                if (Math.random() < 0.3) return null; // 30% chance of a slight pause
+                const aiPlayers = eligiblePlayers.filter(p => !p.isHuman && !p.jailed && p.isAlive);
+                if (aiPlayers.length === 0) return null;
+                return aiPlayers[Math.floor(Math.random() * aiPlayers.length)];
             }
-            return Math.min(100, Math.max(0, score));
+            
+            const recent = recentDiscussion.slice(-6).join('\n');
+            const aiPlayers = eligiblePlayers.filter(p => !p.isHuman && !p.jailed && p.isAlive);
+            if (aiPlayers.length === 0) return null;
+
+            let playersInfo = aiPlayers.map(p => {
+                return `- ${p.name} (Role: ${p.role}, Personality: ${p.playstyle || 'Normal'})`;
+            }).join('\n');
+
+            const prompt = `You are the Discussion Scheduler.
+Decide who speaks next.
+
+RECENT DISCUSSION:
+${recent ? recent : "None yet."}
+
+ELIGIBLE PLAYERS:
+${playersInfo}
+
+TASK:
+Pick ONE eligible player to speak next. Prefer players who were asked questions, accused, or haven't spoken recently. If the conversation should pause naturally, pick NONE.
+
+OUTPUT FORMAT:
+PLAYER: <name>
+or
+PLAYER: NONE`;
+
+            try {
+                const response = await fetch('http://127.0.0.1:11434/api/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ model: 'smollm2:135m', messages: [{ role: 'user', content: prompt }], stream: false })
+                });
+                const data = await response.json();
+                let text = data.message?.content || "";
+                let match = text.match(/PLAYER:\s*([A-Za-z0-9_]+)/i);
+                if (match) {
+                    const name = match[1].trim();
+                    if (name.toUpperCase() === 'NONE') return null;
+                    const speaker = aiPlayers.find(p => p.name.toLowerCase() === name.toLowerCase());
+                    return speaker || null;
+                }
+            } catch (e) {
+                console.warn("Ollama scheduler error:", e);
+                return aiPlayers[Math.floor(Math.random() * aiPlayers.length)];
+            }
+            return null;
         };
 
         const runDynamicDiscussion = async (durationSeconds, eligiblePlayers, visibility, validMafiaTargets = []) => {
             let endTime = Date.now() + durationSeconds * 1000;
-            let lastSpokeId = null;
-            let cooldowns = {};
 
             window.currentDiscussionVisibility = visibility;
             if (humanPlaying && players.find(p => p.isHuman && p.isAlive && !p.jailed && eligiblePlayers.some(ep => ep.id === p.id))) {
@@ -989,63 +1018,41 @@ ${formatGuide}
             }, 1000);
 
             while (isGameActive && Date.now() < endTime) {
-                let aiPlayers = eligiblePlayers.filter(p => !p.isHuman && !p.jailed && p.isAlive);
-                if (aiPlayers.length === 0) {
+                let speaker = await getNextSpeaker(eligiblePlayers, visibility);
+
+                if (Date.now() >= endTime) break;
+
+                if (!speaker) {
                     await delay(2000);
                     continue;
                 }
 
-                let scorePromises = aiPlayers.map(p => getSpeakScore(p));
-                let scores = await Promise.all(scorePromises);
-
-                let maxScore = -1;
-                let speaker = null;
-
-                for (let i = 0; i < aiPlayers.length; i++) {
-                    let ai = aiPlayers[i];
-                    let score = scores[i];
-
-                    if (ai.id === lastSpokeId) score -= 40;
-                    if (cooldowns[ai.id] > Date.now()) score = 0;
-
-                    if (score > maxScore && score > 20) {
-                        maxScore = score;
-                        speaker = ai;
-                    }
+                activePlayer = speaker.id;
+                renderGameBoard();
+                
+                let promptTask = `Write exactly one public discussion message. Answer questions, challenge evidence, defend yourself, ask follow-up questions, or change opinions based on recent events. Do NOT repeat previous arguments. Do not vote. Do not perform any actions. Do not include internal thoughts.`;
+                if (visibility.includes('Mafia')) {
+                    promptTask = `Discuss with your fellow mafia who you should eliminate tonight. Valid targets are: ${validMafiaTargets.join(', ')}. Write exactly one private discussion message. Do not vote yet.`;
                 }
-
-                if (speaker && Date.now() < endTime) {
-                    activePlayer = speaker.id;
-                    renderGameBoard();
-                    
-                    let promptTask = `Write exactly one public discussion message. Defend yourself, accuse others, or share information. Do not vote. Do not perform any actions. Do not include internal thoughts.`;
-                    if (visibility.includes('Mafia')) {
-                        promptTask = `Discuss with your fellow mafia who you should eliminate tonight. Valid targets are: ${validMafiaTargets.join(', ')}. Write exactly one private discussion message. Do not vote yet.`;
-                    }
-                    
-                    if (speaker.isEnlightened) {
-                        const punct = ['!', '.', '...', '?!'][Math.floor(Math.random()*4)];
-                        let msg = "Enlightened" + punct;
+                
+                if (speaker.isEnlightened) {
+                    const punct = ['!', '.', '...', '?!'][Math.floor(Math.random()*4)];
+                    let msg = "Enlightened" + punct;
+                    window.addLog(msg, visibility, null, speaker.name);
+                } else {
+                    let msg = await callAI(speaker.id, promptTask, 'chat');
+                    if (msg && Date.now() < endTime) { 
                         window.addLog(msg, visibility, null, speaker.name);
-                    } else {
-                        let msg = await callAI(speaker.id, promptTask, 'chat');
-                        if (msg && Date.now() < endTime) { 
-                            window.addLog(msg, visibility, null, speaker.name);
-                            if (visibility.includes('Mafia')) {
-                                aiMemory[speaker.id].actionHistory.push(`Night ${gameDay} Chat: ${msg}`);
-                            }
+                        if (visibility.includes('Mafia')) {
+                            aiMemory[speaker.id].actionHistory.push(`Night ${gameDay} Chat: ${msg}`);
                         }
                     }
-
-                    lastSpokeId = speaker.id;
-                    cooldowns[speaker.id] = Date.now() + 10000; 
-                    activePlayer = null;
-                    renderGameBoard();
-                    
-                    await delay(3000); 
-                } else {
-                    await delay(2000);
                 }
+
+                activePlayer = null;
+                renderGameBoard();
+                
+                if (Date.now() < endTime) await delay(3000); 
             }
 
             clearInterval(timerInterval);
@@ -1099,6 +1106,16 @@ ${formatGuide}
                         const data = await response.json();
                         if (!response.ok) throw new Error(data.error?.message || `HTTP ${response.status}`);
                         text = data.choices?.[0]?.message?.content || "";
+                        
+                    } else if (ai.api === 'ollama') {
+                        const response = await fetch('http://127.0.0.1:11434/api/chat', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ model: ollamaModel, messages: [{ role: 'user', content: fullPrompt }], stream: false })
+                        });
+                        const data = await response.json();
+                        if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+                        text = data.message?.content || "";
                         
                     } else {
                         const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key=${geminiApiKey}`, {
@@ -1170,6 +1187,8 @@ ${formatGuide}
                 humanPromptText = promptText;
                 humanResolve = (val) => {
                     humanInputMode = null;
+                    renderGameBoard();
+                    renderModeratorPanel();
                     resolve(val);
                 };
                 renderGameBoard();
